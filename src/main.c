@@ -2,9 +2,9 @@
 #include <stdio.h>
 #include <signal.h>
 
-#include "uv.h"
-#include "duktape.h"
-#include "llhttp.h"
+#include <uv.h>
+#include <duktape.h>
+#include <http_parser.h>
 
 #define CHECK(result) \
   do { \
@@ -41,7 +41,7 @@ struct conn_s {
   uv_buf_t header_field;
   uv_buf_t header_value;
 
-  llhttp_t http;
+  http_parser http;
 
   duk_context* duk_ctx;
   duk_idx_t headers_obj;
@@ -54,7 +54,7 @@ static const int FILE_READ_CHUNK_LEN = 4096;
 
 static uv_loop_t loop;
 static uv_tcp_t tcp_server;
-static llhttp_settings_t http_settings;
+static http_parser_settings http_settings;
 static bytecode_t bytecode;
 
 /* Callbacks */
@@ -105,10 +105,10 @@ static void conn_read_cb(uv_stream_t* stream, ssize_t nread,
     return;
   }
 
-  if (HPE_OK != llhttp_execute(&conn->http, buf->base, nread)) {
-    fprintf(stderr, "parsing error: %s at pos: %d\n",
-        llhttp_get_error_reason(&conn->http),
-        (int) (llhttp_get_error_pos(&conn->http) - buf->base));
+  if (HPE_OK != http_parser_execute(&conn->http, &http_settings, buf->base, nread)) {
+    fprintf(stderr, "parsing error: %s and %s\n",
+        http_errno_name(conn->http.http_errno),
+        http_errno_description(conn->http.http_errno));
 
     uv_close((uv_handle_t*) stream, conn_on_close);
     return;
@@ -149,8 +149,8 @@ static void on_connection(uv_stream_t* server, int status) {
 
   CHECK_EQ(0, uv_accept(server, (uv_stream_t*) &conn->tcp_client));
 
-  /* Initialize llhttp */
-  llhttp_init(&conn->http, HTTP_REQUEST, &http_settings);
+  /* Initialize http_parser */
+  http_parser_init(&conn->http, HTTP_REQUEST);
   conn->http.data = conn;
 
   /* Initialize duktape */
@@ -168,7 +168,7 @@ static void on_connection(uv_stream_t* server, int status) {
         conn_read_cb));
 }
 
-static int conn_on_message_begin(llhttp_t* http) {
+static int conn_on_message_begin(http_parser* http) {
   conn_t* conn = http->data;
 
   /* Duplicate function which should be on the stack */
@@ -191,7 +191,7 @@ static void append_to_buffer(uv_buf_t* buf,
   buf->len += len;
 }
 
-static int conn_on_url(llhttp_t* http, const char* p, size_t len) {
+static int conn_on_url(http_parser* http, const char* p, size_t len) {
   conn_t* conn = http->data;
 
   append_to_buffer(&conn->url, p, len);
@@ -218,7 +218,7 @@ static void conn_add_headers(conn_t* conn) {
   conn->header_value = uv_buf_init(NULL, 0);
 }
 
-static int conn_on_header_field(llhttp_t* http, const char* p, size_t len) {
+static int conn_on_header_field(http_parser* http, const char* p, size_t len) {
   conn_t* conn = http->data;
 
   conn_add_headers(conn);
@@ -228,7 +228,7 @@ static int conn_on_header_field(llhttp_t* http, const char* p, size_t len) {
   return HPE_OK;
 }
 
-static int conn_on_header_value(llhttp_t* http, const char* p, size_t len) {
+static int conn_on_header_value(http_parser* http, const char* p, size_t len) {
   conn_t* conn = http->data;
 
   append_to_buffer(&conn->header_value, p, len);
@@ -236,7 +236,7 @@ static int conn_on_header_value(llhttp_t* http, const char* p, size_t len) {
   return HPE_OK;
 }
 
-static int conn_on_message_complete(llhttp_t* http) {
+static int conn_on_message_complete(http_parser* http) {
   conn_t* conn = http->data;
   duk_context* ctx = conn->duk_ctx;
 
@@ -245,7 +245,7 @@ static int conn_on_message_complete(llhttp_t* http) {
   conn_add_headers(conn);
 
   duk_push_lstring(ctx, conn->url.base, conn->url.len);
-  duk_push_string(ctx, llhttp_method_name(http->method));
+  duk_push_string(ctx, http_method_str(http->method));
 
   duk_call(ctx, 3);
 
@@ -383,7 +383,7 @@ int main(int argc, char** argv) {
 
   bytecode = compile_bytecode(argv[1]);
 
-  llhttp_settings_init(&http_settings);
+  http_parser_settings_init(&http_settings);
 
   http_settings.on_message_begin = conn_on_message_begin;
   http_settings.on_url = conn_on_url;
